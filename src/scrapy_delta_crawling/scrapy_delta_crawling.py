@@ -9,12 +9,14 @@ class DeltaCrawlingPipeline:
     # TODO: assert that the spider has a pk attr or setting list[any]
 
     previous_items = {}
-    sh_client = ScrapinghubClient()
 
-    def __init__(self, primary_key_fields, data_diff_field, keep_data_diff_field):
+    def __init__(
+        self, primary_key_fields, data_diff_field, keep_data_diff_field, sh_apikey
+    ):
         self.primary_key_fields = primary_key_fields
         self.DATA_DIFF_FIELD = data_diff_field
         self.KEEP_DATA_DIFF_FIELD = keep_data_diff_field
+        self.sh_client = ScrapinghubClient(sh_apikey)
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -29,6 +31,7 @@ class DeltaCrawlingPipeline:
             collection_name=crawler.settings.get(
                 "DELTA_CRAWL_COLLECTION_NAME", crawler.spider.name
             ),
+            sh_apikey=crawler.settings.get("SH_APIKEY", None),
         )
 
     def open_spider(self, spider):
