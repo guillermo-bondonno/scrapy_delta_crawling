@@ -18,7 +18,8 @@ classifiers = [
 ]
 license = {text = "Not open source"}
 dependencies = [
-  
+  "scrapy",
+  "scrapinghub"
 ]
 
 [project.optional-dependencies]

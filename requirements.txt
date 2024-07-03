@@ -1,2 +1,0 @@
-scrapinghub
-scrapy
