@@ -2,6 +2,10 @@ from typing import Union
 import copy
 from scrapy.exceptions import DropItem
 from scrapinghub import ScrapinghubClient
+from typing import Any
+import json
+import os
+from scrapy_delta_crawling.diff_functions import ngram_distance, image_distance
 
 
 class DeltaCrawlingPipeline:
@@ -11,12 +15,22 @@ class DeltaCrawlingPipeline:
     previous_items = {}
 
     def __init__(
-        self, primary_key_fields, data_diff_field, keep_data_diff_field, sh_apikey
+        self,
+        primary_key_fields: list,
+        data_diff_field: str,
+        keep_data_diff_field: bool,
+        sh_apikey: str,
+        diff_functions: dict,
+        previous_items_file_path: str,
+        collection_name: str,
     ):
         self.primary_key_fields = primary_key_fields
         self.DATA_DIFF_FIELD = data_diff_field
         self.KEEP_DATA_DIFF_FIELD = keep_data_diff_field
         self.sh_client = ScrapinghubClient(sh_apikey)
+        self.diff_functions = self.build_comparators(diff_functions)
+        self.previous_items_file_path = previous_items_file_path
+        self.collection_name = collection_name
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -28,10 +42,12 @@ class DeltaCrawlingPipeline:
             keep_data_diff_field=crawler.settings.get(
                 "DELTA_CRAWL_KEEP_DIFF_FIELD", True
             ),
-            collection_name=crawler.settings.get(
-                "DELTA_CRAWL_COLLECTION_NAME", crawler.spider.name
-            ),
+            collection_name=crawler.settings.get("DELTA_CRAWL_COLLECTION_NAME", None),
             sh_apikey=crawler.settings.get("SH_APIKEY", None),
+            diff_functions=crawler.settings.get("DELTA_CRAWL_DIFF_FUNCTIONS", {}),
+            previous_items_file_path=crawler.settings.get(
+                "DELTA_CRAWL_PREVIOUS_ITEMS_FILE_PATH", None
+            ),
         )
 
     def open_spider(self, spider):
@@ -44,23 +60,85 @@ class DeltaCrawlingPipeline:
                 "(PRIMARY_KEY_FIELDS) or spider attr primary_key_fields."
             )
 
-        self.load_collection()
+        self.load_previous_items()
 
-    def load_collection(self):
-        self.collection = self.sh_client.collections.get_collection(
-            self.collection_name
-        )
-        self.previous_items = {
-            self.get_pk(item): item
-            # TODO check if iter() returns items or collection items ?
-            for item in self.collection.iter()
-        }
+    @staticmethod
+    def items_from_file(file_path: str):
+        if file_path.endswith(".json"):
+            with open(file_path, "r") as f:
+                for item in json.load(f):
+                    yield item
+
+    def items_from_collection(self):
+        project_id = os.environ.get("SH_JOBKEY").split("/")[0]
+        assert project_id, "SH_JOBKEY not set"
+        project = self.sh_client.get_project(project_id)
+
+        for collection in project.collections.iter():
+            if collection["name"] == self.collection_name:
+                collection_getter = {
+                    "s": "get_store",
+                    "cs": "get_cached_store",
+                    "vs": "get_versioned_store",
+                    "vcs": "get_versioned_cached_store",
+                }[collection["type"]]
+                for item in getattr(project, collection_getter)(
+                    collection["name"]
+                ).iter():
+                    yield item
+
+    def load_previous_items(self):
+        file_path = self.previous_items_file_path
+
+        if bool(self.collection_name):
+            items_iterator = self.items_from_collection()
+            project_id = os.environ.get("SH_JOBKEY", "").split("/")[0]
+            items_iterator = (
+                self.sh_client.get_project(project_id)
+                .collections.get_store(self.collection_name)
+                .iter()
+            )
+        elif bool(file_path):
+            items_iterator = self.items_from_file(file_path)
+        else:
+            raise ValueError(
+                "Either DELTA_CRAWL_COLLECTION_NAME or DELTA_CRAWL_PREVIOUS_ITEMS_FILE_PATH (not both) must be set"
+            )
+
+        self.previous_items = {}
+        for item in items_iterator:
+            item.pop("_key", None)
+            self.previous_items[self.get_pk(item)] = item
 
     def get_pk(self, item):
         return tuple(item.get(field) for field in self.primary_key_fields)
 
     def _get_previous_item(self, primary_key):
         return self.previous_items.get(primary_key)
+
+    @staticmethod
+    def default_diff_function(previous, current):
+        return previous != current, None
+
+    def build_comparators(self, diff_functions):
+        # TODO: build the functions from the settings import paths if str
+        result = {}
+        for key, value in diff_functions.items():
+            if isinstance(value, str):
+                pass
+            elif callable(value):
+                result[key] = value
+        return result
+
+    def compare_fields(self, field, previous, current) -> tuple[bool, Any, Any]:
+        diff_function = self.diff_functions.get(field)
+
+        diff_name = "identity" or diff_function.__name__
+        diff_function = diff_function or self.default_diff_function
+
+        is_different, distance = diff_function(previous, current)
+
+        return is_different, distance, diff_name
 
     def populate_data_diff_field(
         self, item: dict, previous_item: Union[dict, None]
@@ -69,33 +147,47 @@ class DeltaCrawlingPipeline:
         result["diff"] = {}
         if previous_item is None:
             result["is_new"] = True
-            return result
+            item[self.DATA_DIFF_FIELD] = result
+            return
         result["is_new"] = False
 
-        for key, value in copy.deepcopy(item).items():
-            previous = previous_item.get(key)
-            if previous != value:
-                result["diff"][key] = {"previous": previous, "current": value}
+        for field, value in copy.deepcopy(item).items():
+            if field == self.DATA_DIFF_FIELD:
+                continue
+            previous = previous_item.get(field)
+            is_different, diff_value, diff_function = self.compare_fields(
+                field, previous, value
+            )
+            if is_different:
+                result["diff"][field] = {
+                    "previous": previous,
+                    "current": value,
+                    "diff": diff_value,
+                    "diff_function": diff_function,
+                }
 
         item[self.DATA_DIFF_FIELD] = result
 
-        return item
-
-    def drop_item(self, item: dict) -> bool:
+    def process_differences(self, item: dict) -> bool:
         """
-        Decide if we should drop the item based on the info in item[DATA_DIFF_FIELD]
+        Decide what to do with the item based on the info in item[DATA_DIFF_FIELD]
         Default beahviour is to drop the item if it wasn't modified
         """
-        return not item[self.DATA_DIFF_FIELD]["diff"]
+        if (
+            not item[self.DATA_DIFF_FIELD]["diff"]
+            and not item[self.DATA_DIFF_FIELD]["is_new"]
+        ):
+            raise DropItem("Item already seen and not modified. Dropping.")
 
     def process_item(self, item, spider):
+        # TODO: handle items that are not dicts
+        # convert to dict and convert back to the original type before returning
         primary_key = self.get_pk(item)
         previous_item = self._get_previous_item(primary_key)
 
-        item = self.populate_data_diff_field(item, previous_item)
+        self.populate_data_diff_field(item, previous_item)
 
-        if self.drop_item(item, previous_item):
-            raise DropItem()
+        self.process_differences(item)
 
         if not self.KEEP_DATA_DIFF_FIELD:
             del item[self.DATA_DIFF_FIELD]
