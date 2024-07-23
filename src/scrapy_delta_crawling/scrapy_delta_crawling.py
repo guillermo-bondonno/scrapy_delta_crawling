@@ -5,7 +5,6 @@ from scrapinghub import ScrapinghubClient
 from typing import Any
 import json
 import os
-from scrapy_delta_crawling.diff_functions import ngram_distance, image_distance
 
 
 class DeltaCrawlingPipeline:
@@ -23,6 +22,7 @@ class DeltaCrawlingPipeline:
         diff_functions: dict,
         previous_items_file_path: str,
         collection_name: str,
+        fields_to_compare: list,
     ):
         self.primary_key_fields = primary_key_fields
         self.DATA_DIFF_FIELD = data_diff_field
@@ -31,6 +31,7 @@ class DeltaCrawlingPipeline:
         self.diff_functions = self.build_comparators(diff_functions)
         self.previous_items_file_path = previous_items_file_path
         self.collection_name = collection_name
+        self.fields_to_compare = fields_to_compare
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -48,9 +49,11 @@ class DeltaCrawlingPipeline:
             previous_items_file_path=crawler.settings.get(
                 "DELTA_CRAWL_PREVIOUS_ITEMS_FILE_PATH", None
             ),
+            fields_to_compare=crawler.settings.get("DELTA_CRAWL_FIELDS_TO_COMPARE", []),
         )
 
     def open_spider(self, spider):
+        self.spider_name = spider.name
         if getattr(spider, "primary_key_fields", None) is not None:
             self.primary_key_fields = spider.primary_key_fields
 
@@ -69,11 +72,23 @@ class DeltaCrawlingPipeline:
                 for item in json.load(f):
                     yield item
 
+    def items_from_previous_job(self):
+        project_id = os.environ.get("SH_JOBKEY").split("/")[0]
+        # get the latest finished job with the self.spider_name name
+        job = next(
+            self.sh_client.get_project(project_id).jobs.iter(
+                spider=self.spider_name, state="finished"
+            )
+        )
+        for item in self.sh_client.get_job(job["key"]).items.iter():
+            yield item
+
     def items_from_collection(self):
         project_id = os.environ.get("SH_JOBKEY").split("/")[0]
         assert project_id, "SH_JOBKEY not set"
         project = self.sh_client.get_project(project_id)
 
+        collection_found = False
         for collection in project.collections.iter():
             if collection["name"] == self.collection_name:
                 collection_getter = {
@@ -82,10 +97,19 @@ class DeltaCrawlingPipeline:
                     "vs": "get_versioned_store",
                     "vcs": "get_versioned_cached_store",
                 }[collection["type"]]
-                for item in getattr(project, collection_getter)(
+                self.collection_object = getattr(project, collection_getter)(
                     collection["name"]
-                ).iter():
+                )
+                collection_found = True
+                for item in self.collection_object.iter():
                     yield item
+        if not collection_found:
+            raise ValueError(
+                f"Collection {self.collection_name} not found in project {project_id}"
+            )
+
+    def only_fields_to_compare(self, item):
+        return {field: item.get(field) for field in self.fields_to_compare}
 
     def load_previous_items(self):
         file_path = self.previous_items_file_path
@@ -101,14 +125,19 @@ class DeltaCrawlingPipeline:
         elif bool(file_path):
             items_iterator = self.items_from_file(file_path)
         else:
-            raise ValueError(
-                "Either DELTA_CRAWL_COLLECTION_NAME or DELTA_CRAWL_PREVIOUS_ITEMS_FILE_PATH (not both) must be set"
-            )
+            try:
+                items_iterator = self.items_from_previous_job()
+            except Exception:
+                raise ValueError(
+                    "Couldn't fetch items from previous finished job. Make "
+                    "sure the job exists and is finished or either "
+                    "DELTA_CRAWL_COLLECTION_NAME or DELTA_CRAWL_PREVIOUS_ITEMS_FILE_PATH (not both)"
+                )
 
         self.previous_items = {}
         for item in items_iterator:
             item.pop("_key", None)
-            self.previous_items[self.get_pk(item)] = item
+            self.previous_items[self.get_pk(item)] = self.only_fields_to_compare(item)
 
     def get_pk(self, item):
         return tuple(item.get(field) for field in self.primary_key_fields)
@@ -179,6 +208,9 @@ class DeltaCrawlingPipeline:
         ):
             raise DropItem("Item already seen and not modified. Dropping.")
 
+    def update_item_in_collection(self, item: dict):
+        assert hasattr(self, "collection_object"), "Collection not set"
+
     def process_item(self, item, spider):
         # TODO: handle items that are not dicts
         # convert to dict and convert back to the original type before returning
@@ -188,6 +220,9 @@ class DeltaCrawlingPipeline:
         self.populate_data_diff_field(item, previous_item)
 
         self.process_differences(item)
+
+        if bool(self.collection_name):
+            self.update_item_in_collection(item)
 
         if not self.KEEP_DATA_DIFF_FIELD:
             del item[self.DATA_DIFF_FIELD]
