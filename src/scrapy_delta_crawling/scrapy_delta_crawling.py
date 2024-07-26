@@ -6,18 +6,8 @@ from typing import Any
 import json
 import os
 from itemadapter import ItemAdapter
-
+from scrapy.utils.misc import load_object
 import importlib
-
-
-def build_callable_from_path(import_path):
-    module_path, func_name = import_path.rsplit(".", 1)
-    module = importlib.import_module(module_path)
-
-    func = getattr(module, func_name)
-
-    return func
-
 
 class DeltaCrawlingPipeline:
 
@@ -168,13 +158,9 @@ class DeltaCrawlingPipeline:
     def build_comparators(self, diff_functions):
         # TODO maybe check the signature of the functions
         # to ensure it's (previous: Any, current: Any) -> tuple[bool, Any]
-        result = {}
-        for key, value in diff_functions.items():
-            if isinstance(value, str):
-                result[key] = build_callable_from_path(value)
-            elif callable(value):
-                result[key] = value
-        return result
+        return {
+            key : load_object(value) for key, value in diff_functions.items()
+        }
 
     def compare_fields(self, field, previous, current) -> tuple[bool, Any, Any]:
         diff_function = self.diff_functions.get(field)
