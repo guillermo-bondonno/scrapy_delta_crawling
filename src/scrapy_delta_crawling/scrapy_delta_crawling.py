@@ -5,11 +5,21 @@ from scrapinghub import ScrapinghubClient
 from typing import Any
 import json
 import os
+from itemadapter import ItemAdapter
+
+import importlib
+
+
+def build_callable_from_path(import_path):
+    module_path, func_name = import_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+
+    func = getattr(module, func_name)
+
+    return func
 
 
 class DeltaCrawlingPipeline:
-
-    # TODO: assert that the spider has a pk attr or setting list[any]
 
     previous_items = {}
 
@@ -109,12 +119,17 @@ class DeltaCrawlingPipeline:
             )
 
     def only_fields_to_compare(self, item):
-        return {field: item.get(field) for field in self.fields_to_compare}
+        return (
+            {field: item.get(field) for field in self.fields_to_compare}
+            if self.fields_to_compare
+            else item
+        )
 
     def load_previous_items(self):
-        file_path = self.previous_items_file_path
 
+        file_path = self.previous_items_file_path
         if bool(self.collection_name):
+            # format [{'_key' : "...", other fields }, ...]
             items_iterator = self.items_from_collection()
             project_id = os.environ.get("SH_JOBKEY", "").split("/")[0]
             items_iterator = (
@@ -123,6 +138,7 @@ class DeltaCrawlingPipeline:
                 .iter()
             )
         elif bool(file_path):
+            # format: [{**item}, ...]
             items_iterator = self.items_from_file(file_path)
         else:
             try:
@@ -150,11 +166,12 @@ class DeltaCrawlingPipeline:
         return previous != current, None
 
     def build_comparators(self, diff_functions):
-        # TODO: build the functions from the settings import paths if str
+        # TODO maybe check the signature of the functions
+        # to ensure it's (previous: Any, current: Any) -> tuple[bool, Any]
         result = {}
         for key, value in diff_functions.items():
             if isinstance(value, str):
-                pass
+                result[key] = build_callable_from_path(value)
             elif callable(value):
                 result[key] = value
         return result
@@ -181,7 +198,11 @@ class DeltaCrawlingPipeline:
         result["is_new"] = False
 
         for field, value in copy.deepcopy(item).items():
-            if field == self.DATA_DIFF_FIELD:
+            if (
+                field == self.DATA_DIFF_FIELD
+                or field not in self.fields_to_compare
+                or field in self.primary_key_fields
+            ):
                 continue
             previous = previous_item.get(field)
             is_different, diff_value, diff_function = self.compare_fields(
@@ -212,8 +233,9 @@ class DeltaCrawlingPipeline:
         assert hasattr(self, "collection_object"), "Collection not set"
 
     def process_item(self, item, spider):
-        # TODO: handle items that are not dicts
-        # convert to dict and convert back to the original type before returning
+        item_type = type(item)
+        item = ItemAdapter(item)
+
         primary_key = self.get_pk(item)
         previous_item = self._get_previous_item(primary_key)
 
@@ -226,4 +248,4 @@ class DeltaCrawlingPipeline:
 
         if not self.KEEP_DATA_DIFF_FIELD:
             del item[self.DATA_DIFF_FIELD]
-        return item
+        return item_type(**item)
